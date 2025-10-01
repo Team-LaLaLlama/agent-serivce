@@ -17,6 +17,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document  # 사내 정보 Document 생성용
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ PROPOSAL_DIR = "./proposal"
 RFP_PATH = "./RFP/수협_rfp.txt"
 OUTPUT_DIR = "./output"
 EVALUATION_CRITERIA_PATH = "./standard/evaluation_criteria.md"
+INTERNAL_DATA_DIR = "./internal_data"  # 사내 정보 디렉토리 (기술스택, 담당자, 마이그레이션, 장애이력 등)
 
 # --- 전역 변수 ---
 # 생성된 벡터스토어를 저장할 전역 변수
@@ -199,6 +201,70 @@ def load_all_internal_data(internal_data_dir):
     print(f"✅ 총 {len(all_internal_docs)}개의 사내 정보 항목 로드 완료\n")
     return all_internal_docs
 
+
+def load_all_internal_data_simple(internal_data_dir):
+    """
+    사내 정보 디렉토리의 모든 파일을 간단하게 로드하는 함수
+
+    정형/비정형 구분 없이 모든 .txt 파일을 Document로 변환하여 로드합니다.
+    각 파일은 통째로 하나의 Document가 되며, 파일명에서 문서 타입을 자동 추론합니다.
+
+    Args:
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+
+    Returns:
+        list[Document]: 모든 사내 정보 Document 리스트
+    """
+    all_internal_docs = []
+
+    if not os.path.exists(internal_data_dir):
+        print(f"  ⚠ 사내 정보 디렉토리가 존재하지 않습니다: {internal_data_dir}")
+        return all_internal_docs
+
+    print(f"\n[사내 정보 로드 시작: {internal_data_dir}]")
+
+    # 디렉토리 내 모든 .txt 파일 검색
+    internal_files = glob.glob(os.path.join(internal_data_dir, "*.txt"))
+
+    for file_path in internal_files:
+        filename = os.path.basename(file_path)
+
+        try:
+            # 파일 내용 전체를 읽기
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 파일명에서 문서 타입 자동 분류
+            if 'tech_stack' in filename.lower():
+                doc_type = "사내_기술스택"
+            elif 'contact' in filename.lower():
+                doc_type = "사내_담당자"
+            elif 'migration' in filename.lower():
+                doc_type = "사내_마이그레이션"
+            elif 'incident' in filename.lower():
+                doc_type = "사내_장애이력"
+            else:
+                doc_type = "사내_기타"
+
+            # Document 생성 (파일 전체를 하나의 Document로)
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "doc_type": doc_type,
+                    "source_file": filename
+                }
+            )
+            all_internal_docs.append(doc)
+            print(f"  ✓ [{doc_type}] {filename} 로드 완료 ({len(content)} 자)")
+
+        except Exception as e:
+            print(f"  ✗ {filename} 로드 실패: {e}")
+            continue
+
+    print(f"\n✅ 총 {len(all_internal_docs)}개의 사내 정보 파일 로드 완료\n")
+    return all_internal_docs
+
+
 def create_unified_vectorstore(
     proposal_files,
     rfp_path,
@@ -239,9 +305,17 @@ def create_unified_vectorstore(
     for proposal_path in proposal_files:
         proposal_name = os.path.basename(proposal_path)
         all_documents.extend(load_document(proposal_path, "제안서", proposal_name))
-        
+
+    # 3. 사내 정보 로드 (기술스택, 담당자, 마이그레이션 이력, 장애 이력 등)
+    # 모든 파일을 간단하게 로드 (정형/비정형 구분 없이)
+    print("\n[3단계] 사내 정보 로드")
+    internal_docs = load_all_internal_data_simple(internal_data_dir)
+    all_documents.extend(internal_docs)  # 제안서+RFP에 사내 정보 문서 추가
+
     print(f"\n  [OK] 총 {len(all_documents)}개 문서 섹션 로드 완료")
 
+    # 4. 텍스트 분할 (청크 단위로 쪼개기)
+    print("\n[4단계] 텍스트 청크 분할")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
     splits = text_splitter.split_documents(all_documents)
     print(f"  [OK] {len(splits)}개 청크로 분할 완료")
