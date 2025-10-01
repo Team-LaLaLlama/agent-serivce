@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
 from crewai.llm import LLM
 from bs4 import BeautifulSoup
+from functools import partial   ### 🔧 FIX: partial import (trace 저장시 회사명 전달)
 
 # LangChain 관련 라이브러리 임포트
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -33,6 +34,8 @@ UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # --- 전역 변수 ---
 unified_vectorstore = None
+company_map = {}   # {"A사_제안서": "A사"} 형태
+llm = None         ### 🔧 FIX: llm 전역변수 명시적으로 선언
 
 # =================================================================
 # HTML 청킹 함수 (RAG_pipeline.ipynb에서 가져옴)
@@ -283,6 +286,10 @@ def save_evaluation_report(proposal_name, report_content):
 
 def get_llm_model():
     """환경변수에 따라 LLM 모델을 선택합니다."""
+    global llm
+    if llm is not None:
+        return llm
+
     model_type = os.getenv('LLM_TYPE', 'local').lower()
     
     if model_type == 'local':
@@ -301,18 +308,33 @@ def get_llm_model():
     
     else:
         raise ValueError(f"지원하지 않는 LLM 타입입니다: {model_type}")
+    
+    return llm
 
 async def main():
     print("## LLM 주도형 동적 Agent 생성 및 평가 프로세스를 시작합니다.")
     
     # RAG 파이프라인 초기화
-    global unified_vectorstore
+    global unified_vectorstore, company_map
     proposal_files = glob.glob(os.path.join(PROPOSAL_DIR, "*.html"))
     
     if not proposal_files or not os.path.exists(RFP_PATH):
         print("오류: 제안서 또는 RFP 파일이 없습니다. 경로를 확인하세요.")
         return
     
+    # 회사명 매핑 테이블 생성
+    company_map = {}
+    for file_path in proposal_files:
+        proposal_name = os.path.splitext(os.path.basename(file_path))[0]
+        # 파일명에서 회사명 추출 (예: "A사_제안서" -> "A사")
+        if "_" in proposal_name:
+            company_name = proposal_name.split("_")[0]
+        else:
+            company_name = proposal_name
+        company_map[proposal_name] = company_name
+        print(f"INFO: 회사 매핑 - {proposal_name} -> {company_name}")
+    
+
     # 벡터스토어 로드 또는 생성
     if os.path.exists(CHROMA_PERSIST_DIR):
         print(f"\n기존 벡터 DB를 '{CHROMA_PERSIST_DIR}' 경로에서 불러옵니다...")
@@ -388,7 +410,12 @@ async def main():
         agent=dispatcher_agent
     )
 
-    dispatcher_crew = Crew(agents=[dispatcher_agent], tasks=[dispatcher_task], verbose=False)
+    dispatcher_crew = Crew(
+        agents=[dispatcher_agent], 
+        tasks=[dispatcher_task], 
+        verbose=False,
+        task_callback=partial(task_callback, company="Dispatcher")
+    )
     categorization_result = dispatcher_crew.kickoff()
     
     try:
@@ -512,10 +539,15 @@ async def main():
         print(f"\n총 {len(specialist_agents)}개의 전문가 Agent가 생성되었습니다.")
         print(f"총 {len(evaluation_tasks)}개의 평가 Task가 생성되었습니다.")
 
+        # 현재 회사명으로 task_callback 생성
+        current_company = company_map.get(proposal_name, "Unknown")
+        current_task_callback = partial(task_callback, company=current_company)
+        
         evaluation_crew = Crew(
             agents=specialist_agents,
             tasks=evaluation_tasks,
-            verbose=False
+            verbose=False,
+            task_callback=current_task_callback
         )
         final_results = await evaluation_crew.kickoff_async()
 
@@ -552,18 +584,18 @@ async def main():
             print(f"  ⚠️⚠️ 경고: 부문별 보고서 총합이 {len(individual_reports_text)}자로 여전히 깁니다!")
             print(f"  → 각 부문을 500자로 추가 제한합니다.")
             individual_reports = [report[:500] + "..." for report in individual_reports]
-            individual_reports_text = "\n\n".join(individual_reports)
-            print(f"  → 최종 길이: {len(individual_reports_text)}자")
+        individual_reports_text = "\n\n".join(individual_reports)
+        print(f"  → 최종 길이: {len(individual_reports_text)}자")
 
         reporting_agent = Agent(
             role="수석 평가 분석가",
             goal="부문별 평가를 종합하여 경영진이 의사결정에 활용할 수 있는 완성된 최종 보고서 작성",
             backstory="""당신은 20년 경력의 수석 분석가로, 핵심을 파악하고 전략적 인사이트를 
             제공하는 능력이 뛰어나며, 의사결정자들이 신뢰하는 분석가입니다.""",
-            llm=llm, 
+            llm=get_llm_model(), 
             verbose=True
         )
-        
+
         reporting_task = Task(
             description=f"""'{proposal_name}' 제안서에 대한 부문별 평가를 종합하여 
 최종 평가 보고서를 작성하세요.
@@ -626,7 +658,16 @@ async def main():
             agent=reporting_agent
         )
         
-        reporting_crew = Crew(agents=[reporting_agent], tasks=[reporting_task], verbose=False)
+        # 현재 회사명으로 task_callback 생성
+        current_company = company_map.get(proposal_name, "Unknown")
+        current_task_callback = partial(task_callback, company=current_company)
+        
+        reporting_crew = Crew(
+            agents=[reporting_agent], 
+            tasks=[reporting_task], 
+            verbose=False,
+            task_callback=current_task_callback
+        )
         final_comprehensive_report = reporting_crew.kickoff()
 
         print(f"\n\n[FINAL REPORT] [{proposal_name}] 최종 종합 평가 보고서")
@@ -638,9 +679,213 @@ async def main():
         save_evaluation_report(proposal_name, final_comprehensive_report.raw)
 
 
+# =================================================================
+# 6. 기업별 Trace 저장 함수
+# =================================================================
+
+def save_task_trace(company: str, task_info: dict):
+    """기업별로 task trace를 저장합니다."""
+    trace_dir = os.path.join("traces", company)
+    os.makedirs(trace_dir, exist_ok=True)
+    filepath = os.path.join(trace_dir, "task_log.ndjson")
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(task_info, ensure_ascii=False) + "\n")
+
+def task_callback(task_output, company="Unknown"):
+    """각 작업 완료 시 결과를 로깅하는 콜백 (기업별 저장)"""
+    global company_map
+    
+    task_info = {
+        "type": "task_completed",
+        "task_name": getattr(task_output, "name", None),
+        "agent": str(getattr(task_output, "agent", None)),
+        "status": "completed",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    
+    # 기업별 trace 저장
+    save_task_trace(company, task_info)
+
+# =================================================================
+# 7. 챗봇 관련 함수들 (main_jy.py에서 가져옴)
+# =================================================================
+def normalize_company_name(extracted: str) -> str:   ### 🔧 FIX: 중복 정의 제거 후 최종 버전
+    """추출된 회사명을 proposal_id로 변환, 없으면 all"""
+    if not extracted or extracted=="all":
+        return "all"
+    extracted_clean = extracted.replace(" ","")
+    for pid, cname in company_map.items():
+        if extracted_clean in cname.replace(" ",""):
+            return pid
+    return "all"
+
+
+def classify_question(user_question: str) -> dict:
+    router_agent = Agent(
+        role="질문 분류 전문가",
+        goal="사용자 질문을 정확히 분류하여 intent (회사 내부 정보, 평가 관련, 일반 질문) 결정, 회사명 추출출",
+        backstory="당신은 질문을 분석하여 정확한 카테고리로 분류하는 전문가입니다. 회사 내부 정보, 평가 관련, 일반 질문을 정확히 구분할 수 있습니다.",
+        llm=get_llm_model(),
+        verbose=True
+    )
+    router_task = Task(
+        description=f"""
+다음 질문을 분석하여 정확한 카테고리로 분류하세요:
+
+질문: "{user_question}"
+
+분류 기준:
+1. "company_db": 회사 내부 정보 (부서, 기술스택, 담당자, 조직도 등)
+2. "evaluation": 제안서 평가 관련 (점수, 근거, 보고서, 평가 결과 등)
+3. "other": 위 두 가지에 해당하지 않는 일반 질문
+
+회사명 추출:
+- 평가 관련 질문에서 회사명이 언급되면 추출
+- 없으면 "all"
+
+반드시 다음 JSON 형식으로만 답변하세요:
+{{
+  "intent": "company_db",
+  "company": "A사"
+}}
+        """,
+        expected_output="JSON 객체 (intent와 company 키 포함)",
+        agent=router_agent
+    )
+    crew = Crew(agents=[router_agent],tasks=[router_task],verbose=False)
+    result = crew.kickoff()
+    try:
+        # JSON 추출 및 파싱
+        raw_text = str(result.raw)
+        if "```json" in raw_text:
+            start = raw_text.find("```json") + 7
+            end = raw_text.find("```", start)
+            json_text = raw_text[start:end].strip()
+        elif "```" in raw_text:
+            start = raw_text.find("```") + 3
+            end = raw_text.find("```", start)
+            json_text = raw_text[start:end].strip()
+        else:
+            start = raw_text.find('{')
+            end = raw_text.rfind('}') + 1
+            json_text = raw_text[start:end]
+        
+        parsed = json.loads(json_text)
+        return parsed
+    except Exception as e:
+        print(f"JSON 파싱 오류: {e}")
+        return {"intent":"other","company":"all"}
+
+
+# --- 회사 내부 DB (부서별 기술 스택) ---
+COMPANY_DB = {
+    "기획팀": ["Kafka", "SpringBoot", "Figma", "Notion", "Jira"],
+    "개발팀": ["React", "Vue.js", "Docker", "Kubernetes", "Node.js", "TypeScript"],
+    "운영팀": ["JSP", "OracleDB", "Nginx", "Tomcat", "Shell Script"],
+    "데이터팀": ["Python", "Pandas", "TensorFlow", "PyTorch", "Airflow", "Spark", "Hadoop"],
+    "인프라팀": ["AWS", "GCP", "Azure", "Terraform", "Ansible", "Prometheus", "Grafana"],
+    "보안팀": ["Wazuh", "Splunk", "SIEM", "Nessus", "Burp Suite", "Zero Trust"],
+    "QA팀": ["Selenium", "JMeter", "Postman", "PyTest", "Cypress"],
+    "마케팅팀": ["Google Analytics", "Tableau", "PowerBI", "HubSpot", "Snowflake"],
+    "고객지원팀": ["Zendesk", "Salesforce", "Chatbot", "VoIP", "Freshdesk"]
+}
+
+def search_company_db(user_question: str) -> str:
+    context = "\n".join([f"- {t}: {', '.join(tech)}" for t, tech in COMPANY_DB.items()])
+    prompt = f"""
+사용자 질문: "{user_question}"
+
+회사 내부 기술 스택 정보:
+{context}
+
+위 정보를 바탕으로 정확하고 도움이 되는 답변을 해주세요.
+- 구체적인 부서명과 기술을 명시하세요
+- 간결하고 명확하게 답변하세요
+- 관련 없는 정보는 제외하세요
+"""
+    return get_llm_model().call(prompt)
+
+# ================================================================
+# Evaluation 질문 처리
+# ================================================================
+def load_evaluation_trace(company: str):
+    filepath = os.path.join("traces", company, "task_log.ndjson")
+    if not os.path.exists(filepath):
+        return []
+    with open(filepath, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def answer_evaluation_question(user_question: str, company="all") -> str:
+    if company == "all":
+        companies = list(company_map.keys())
+    else:
+        companies = [company]
+    
+    context = ""
+    for comp in companies:
+        traces = load_evaluation_trace(comp)
+        for t in traces[:5]:
+            task_name = t.get('task_name', 'Unknown')
+            status = t.get('status', 'Unknown')
+            context += f"- {task_name}: {status}\n"
+    
+    if not context:
+        return f"현재 {company} 회사의 평가 데이터가 없습니다. 먼저 제안서 평가를 실행해주세요."
+    
+    prompt = f"""
+사용자 질문: "{user_question}"
+
+평가 기록 데이터:
+{context}
+
+위 평가 기록을 바탕으로 정확하고 도움이 되는 답변을 해주세요.
+- 실제 평가 결과를 인용하여 답변하세요
+- 구체적인 점수나 근거가 있다면 명시하세요
+- 간결하고 명확하게 답변하세요
+"""
+    return get_llm_model().call(prompt)
+
+def answer_general_question(user_question: str) -> str:
+    prompt = f"""
+사용자 질문: "{user_question}"
+
+위 질문에 대해 정확하고 도움이 되는 답변을 해주세요.
+- 간결하고 명확하게 답변하세요
+- 관련 없는 정보는 제외하세요
+- 정확한 정보를 제공하세요
+"""
+    return get_llm_model().call(prompt)
+
+
 def run_main():
     """동기적으로 main 함수를 실행합니다."""
     asyncio.run(main())
 
+def run_chatbot_test():
+    print("================================")
+    print("ChatBot 테스트")
+    print("================================")
+    test_questions = [
+        "우리 회사에서 Kafka 쓰는 부서가 있어?",
+        "왜 A사의 기술 점수는 8점이야?", 
+        "오늘 날씨 어때?",
+        "개발팀에서 뭐 쓰고 있어?",
+        "React 사용하는 팀이 어디야?",
+        "A사의 기술 점수 근거를 알려줘",
+    ]
+    
+    for q in test_questions:
+        result = classify_question(q)
+        intent, company = result.get("intent"), result.get("company", "all")
+        print(f"\nQ: {q}\n분류: {result}")
+        if intent == "company_db":
+            print("A:", search_company_db(q))
+        elif intent == "evaluation":
+            comp_id = normalize_company_name(company)
+            print("A:", answer_evaluation_question(q, comp_id))
+        else:
+            print("A:", answer_general_question(q))
+
 if __name__ == '__main__':
     run_main()
+    run_chatbot_test()
