@@ -93,9 +93,26 @@ def get_context_for_topic(proposal_file, topic):
 
 async def main():
     print("## 동적 Agent 생성 및 평가 프로세스를 시작합니다.")
+    start_time = datetime.now()
+    print(f"시작 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 평가할 제안서 파일 목록
-    proposal_files = ["data/p1.txt", "data/p2.txt"]
+    # 평가할 제안서 파일 목록 (data 폴더의 모든 txt 파일 자동 수집)
+    data_dir = "data"
+    proposal_files = []
+    if os.path.exists(data_dir):
+        for file in os.listdir(data_dir):
+            if file.endswith('.txt'):
+                proposal_files.append(os.path.join(data_dir, file))
+        print(f"발견된 제안서 파일: {len(proposal_files)}개")
+        for file in proposal_files:
+            print(f"  - {file}")
+    else:
+        print("❌ data 폴더가 존재하지 않습니다.")
+        return
+    
+    if not proposal_files:
+        print("❌ data 폴더에 txt 파일이 없습니다.")
+        return
     
     # 전체 심사 항목 리스트 (어떤 대분류가 들어올지 모름)
     unstructured_evaluation_items = [
@@ -120,9 +137,21 @@ async def main():
     
     # 모든 제안서의 결과를 종합하여 최종 비교 보고서 생성
     await generate_comparison_report(all_proposal_results)
+    
+    # 전체 프로세스 완료 시간 측정
+    end_time = datetime.now()
+    total_duration = end_time - start_time
+    print(f"\n{'='*60}")
+    print(f"🏁 전체 프로세스 완료!")
+    print(f"시작 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"완료 시간: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"총 소요 시간: {total_duration}")
+    print(f"{'='*60}")
 
 async def evaluate_single_proposal(proposal_file, unstructured_evaluation_items):
     """단일 제안서에 대한 평가를 수행합니다."""
+    proposal_start_time = datetime.now()
+    print(f"제안서 평가 시작 시간: {proposal_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # =================================================================
     # Phase 1: Dispatcher가 대분류를 스스로 찾아내고 항목 분류
@@ -230,9 +259,20 @@ async def evaluate_single_proposal(proposal_file, unstructured_evaluation_items)
         print(f"\n\n🚀 {proposal_file} 최종 평가 보고서\n==========================================")
         print(final_comprehensive_report.raw)
         
+        # 개별 제안서 평가 완료 시간 측정
+        proposal_end_time = datetime.now()
+        proposal_duration = proposal_end_time - proposal_start_time
+        print(f"\n📊 {proposal_file} 평가 완료!")
+        print(f"시작 시간: {proposal_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"완료 시간: {proposal_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"소요 시간: {proposal_duration}")
+        
         # 개별 제안서 평가 보고서를 파일로 저장
         proposal_name = os.path.splitext(os.path.basename(proposal_file))[0]  # 파일명에서 확장자 제거
-        report_content = f"제안서 평가 보고서\n파일: {proposal_file}\n생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        report_content = f"제안서 평가 보고서\n파일: {proposal_file}\n"
+        report_content += f"시작 시간: {proposal_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report_content += f"완료 시간: {proposal_end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report_content += f"소요 시간: {proposal_duration}\n\n"
         report_content += "="*80 + "\n"
         report_content += "개별 평가 보고서\n"
         report_content += "="*80 + "\n"
@@ -259,8 +299,10 @@ async def evaluate_single_proposal(proposal_file, unstructured_evaluation_items)
 
 async def generate_comparison_report(all_proposal_results):
     """모든 제안서의 결과를 비교하여 최종 비교 보고서를 생성합니다."""
+    comparison_start_time = datetime.now()
     print(f"\n\n{'='*80}")
     print("📊 모든 제안서 비교 분석 보고서")
+    print(f"시작 시간: {comparison_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}")
     
     comparison_agent = Agent(
@@ -299,12 +341,23 @@ async def generate_comparison_report(all_proposal_results):
     comparison_crew = Crew(agents=[comparison_agent], tasks=[comparison_task], verbose=False)
     comparison_result = comparison_crew.kickoff()
     
+    # 비교 분석 완료 시간 측정
+    comparison_end_time = datetime.now()
+    comparison_duration = comparison_end_time - comparison_start_time
+    
     print("\n\n🏆 최종 비교 분석 보고서")
     print("="*80)
     print(comparison_result.raw)
+    print(f"\n📊 비교 분석 완료!")
+    print(f"시작 시간: {comparison_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"완료 시간: {comparison_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"소요 시간: {comparison_duration}")
     
     # 최종 비교 분석 보고서를 파일로 저장
-    comparison_content = f"제안서 비교 분석 보고서\n생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    comparison_content = f"제안서 비교 분석 보고서\n"
+    comparison_content += f"시작 시간: {comparison_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    comparison_content += f"완료 시간: {comparison_end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    comparison_content += f"소요 시간: {comparison_duration}\n\n"
     comparison_content += "="*80 + "\n"
     comparison_content += "최종 비교 분석 보고서\n"
     comparison_content += "="*80 + "\n"
