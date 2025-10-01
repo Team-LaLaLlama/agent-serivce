@@ -4,5 +4,3 @@ lib/
 .DS_Store
 output/*.txt
 data/*.txt
-output/.gitkeep
-data/.gitkeep
