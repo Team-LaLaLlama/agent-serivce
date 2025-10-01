@@ -11,7 +11,7 @@ from crewai.llm import LLM
 
 
 # HuggingFace 토큰 설정 (실제 토큰으로 교체하세요)
-/os.environ["HUGGINGFACEHUB_API_TOKEN"] = "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"
+# os.environ["HUGGINGFACEHUB_API_TOKEN"] = "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"
 
 llm = LLM(
     model="huggingface/meta-llama/Meta-Llama-3-8B-Instruct",
