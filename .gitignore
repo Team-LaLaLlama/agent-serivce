@@ -4,3 +4,4 @@ lib/
 .DS_Store
 output/*.txt
 data/*.txt
+chroma_db_crewai/
