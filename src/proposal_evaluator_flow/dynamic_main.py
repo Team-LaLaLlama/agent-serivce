@@ -30,6 +30,7 @@ RFP_PATH = "./RFP/수협_rfp.pdf"
 OUTPUT_DIR = "./output"
 EVALUATION_CRITERIA_PATH = "./standard/evaluation_criteria.md"
 CHROMA_PERSIST_DIR = "./chroma_db_html_parsed"
+INTERNAL_DATA_DIR = "./internal_data"  # 사내 정보 디렉토리 (기술스택, 담당자, 마이그레이션, 장애이력 등)
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # --- 전역 변수 ---
@@ -124,6 +125,72 @@ def chunk_html_recursively(html_content, proposal_id, max_chunk_size=1000, chunk
     return chunks
 
 # =================================================================
+# 사내 정보 로더 함수
+# =================================================================
+
+def load_all_internal_data_simple(internal_data_dir):
+    """
+    사내 정보 디렉토리의 모든 파일을 간단하게 로드하는 함수
+
+    정형/비정형 구분 없이 모든 .txt 파일을 Document로 변환하여 로드합니다.
+    각 파일은 통째로 하나의 Document가 되며, 파일명에서 문서 타입을 자동 추론합니다.
+
+    Args:
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+
+    Returns:
+        list[Document]: 모든 사내 정보 Document 리스트
+    """
+    all_internal_docs = []
+
+    if not os.path.exists(internal_data_dir):
+        print(f"  ⚠ 사내 정보 디렉토리가 존재하지 않습니다: {internal_data_dir}")
+        return all_internal_docs
+
+    print(f"\n[사내 정보 로드 시작: {internal_data_dir}]")
+
+    # 디렉토리 내 모든 .txt 파일 검색
+    internal_files = glob.glob(os.path.join(internal_data_dir, "*.txt"))
+
+    for file_path in internal_files:
+        filename = os.path.basename(file_path)
+
+        try:
+            # 파일 내용 전체를 읽기
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 파일명에서 문서 타입 자동 분류
+            if 'tech_stack' in filename.lower():
+                doc_type = "사내_기술스택"
+            elif 'contact' in filename.lower():
+                doc_type = "사내_담당자"
+            elif 'migration' in filename.lower():
+                doc_type = "사내_마이그레이션"
+            elif 'incident' in filename.lower():
+                doc_type = "사내_장애이력"
+            else:
+                doc_type = "사내_기타"
+
+            # Document 생성 (파일 전체를 하나의 Document로)
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "doc_type": doc_type,
+                    "source_file": filename
+                }
+            )
+            all_internal_docs.append(doc)
+            print(f"  ✓ [{doc_type}] {filename} 로드 완료 ({len(content)} 자)")
+
+        except Exception as e:
+            print(f"  ✗ {filename} 로드 실패: {e}")
+            continue
+
+    print(f"\n✅ 총 {len(all_internal_docs)}개의 사내 정보 파일 로드 완료\n")
+    return all_internal_docs
+
+# =================================================================
 # RAG 초기화 함수
 # =================================================================
 
@@ -181,12 +248,43 @@ def create_unified_vectorstore(proposal_files, rfp_path, embedding_model):
             proposal_id = os.path.splitext(os.path.basename(file_path))[0]
             with open(file_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-            
+
             proposal_chunks = chunk_html_recursively(html_content, proposal_id)
             all_chunked_data.extend(proposal_chunks)
             print(f"  ✓ 제안서 '{proposal_id}' 처리 완료: {len(proposal_chunks)}개 청크 생성")
         except Exception as e:
             print(f"  ✗ 제안서 '{os.path.basename(file_path)}' 처리 중 오류: {e}")
+
+    # 3. 사내 정보 로드 (기술스택, 담당자, 마이그레이션 이력, 장애 이력 등)
+    print("\n[사내 정보 처리]")
+    internal_docs = load_all_internal_data_simple(INTERNAL_DATA_DIR)
+
+    # 사내 정보를 청크 형태로 변환 (기존 구조와 통일)
+    for idx, doc in enumerate(internal_docs):
+        doc_type = doc.metadata.get("doc_type", "사내_기타")
+        source_file = doc.metadata.get("source_file", "unknown")
+
+        # 내용이 긴 경우 적절히 분할 (max 1000자)
+        content = doc.page_content
+        if len(content) > 1000:
+            # 1000자 단위로 분할 (오버랩 100자)
+            chunks = split_text_by_length(content, 1000, 100)
+            for chunk_idx, chunk in enumerate(chunks):
+                all_chunked_data.append({
+                    "proposal_id": f"internal_{doc_type}",
+                    "source_id": f"internal_{source_file}_{idx}_{chunk_idx}",
+                    "heading_context": f"{doc_type} > {source_file}",
+                    "original_text": chunk
+                })
+        else:
+            all_chunked_data.append({
+                "proposal_id": f"internal_{doc_type}",
+                "source_id": f"internal_{source_file}_{idx}",
+                "heading_context": f"{doc_type} > {source_file}",
+                "original_text": content
+            })
+
+    print(f"  ✓ 사내 정보 {len(internal_docs)}개 파일을 청크로 변환 완료")
 
     if not all_chunked_data:
         print("\n벡터 DB에 저장할 데이터가 없습니다.")
@@ -777,33 +875,48 @@ def classify_question(user_question: str) -> dict:
         return {"intent":"other","company":"all"}
 
 
-# --- 회사 내부 DB (부서별 기술 스택) ---
-COMPANY_DB = {
-    "기획팀": ["Kafka", "SpringBoot", "Figma", "Notion", "Jira"],
-    "개발팀": ["React", "Vue.js", "Docker", "Kubernetes", "Node.js", "TypeScript"],
-    "운영팀": ["JSP", "OracleDB", "Nginx", "Tomcat", "Shell Script"],
-    "데이터팀": ["Python", "Pandas", "TensorFlow", "PyTorch", "Airflow", "Spark", "Hadoop"],
-    "인프라팀": ["AWS", "GCP", "Azure", "Terraform", "Ansible", "Prometheus", "Grafana"],
-    "보안팀": ["Wazuh", "Splunk", "SIEM", "Nessus", "Burp Suite", "Zero Trust"],
-    "QA팀": ["Selenium", "JMeter", "Postman", "PyTest", "Cypress"],
-    "마케팅팀": ["Google Analytics", "Tableau", "PowerBI", "HubSpot", "Snowflake"],
-    "고객지원팀": ["Zendesk", "Salesforce", "Chatbot", "VoIP", "Freshdesk"]
-}
-
 def search_company_db(user_question: str) -> str:
-    context = "\n".join([f"- {t}: {', '.join(tech)}" for t, tech in COMPANY_DB.items()])
-    prompt = f"""
+    """벡터스토어에서 사내 정보를 검색하여 답변합니다."""
+    global unified_vectorstore
+
+    if unified_vectorstore is None:
+        return "오류: 벡터스토어가 초기화되지 않았습니다. 먼저 평가를 실행해주세요."
+
+    # 벡터스토어에서 사내 정보 검색 (사내_로 시작하는 proposal_id 필터링)
+    try:
+        # 모든 사내 정보 타입에서 검색
+        all_results = []
+        internal_types = ["사내_기술스택", "사내_담당자", "사내_마이그레이션", "사내_장애이력", "사내_기타"]
+
+        for doc_type in internal_types:
+            results = unified_vectorstore.similarity_search(
+                query=user_question,
+                k=3,
+                filter={"proposal_id": f"internal_{doc_type}"}
+            )
+            all_results.extend(results)
+
+        if not all_results:
+            return "관련된 사내 정보를 찾을 수 없습니다."
+
+        # 검색 결과를 컨텍스트로 변환
+        context = "\n\n".join([doc.page_content for doc in all_results[:5]])  # 상위 5개만 사용
+
+        prompt = f"""
 사용자 질문: "{user_question}"
 
-회사 내부 기술 스택 정보:
+회사 내부 정보:
 {context}
 
 위 정보를 바탕으로 정확하고 도움이 되는 답변을 해주세요.
-- 구체적인 부서명과 기술을 명시하세요
+- 구체적인 정보를 명시하세요
 - 간결하고 명확하게 답변하세요
 - 관련 없는 정보는 제외하세요
 """
-    return get_llm_model().call(prompt)
+        return get_llm_model().call(prompt)
+
+    except Exception as e:
+        return f"사내 정보 검색 중 오류 발생: {e}"
 
 # ================================================================
 # Evaluation 질문 처리
