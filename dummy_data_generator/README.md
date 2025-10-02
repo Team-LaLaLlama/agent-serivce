@@ -2,26 +2,53 @@
 
 IT 프로젝트 제안서 평가를 위한 Fine-tuning 데이터셋을 자동 생성하는 도구입니다.
 
-## 🚀 두 가지 실행 방법
+## 🚀 실행 방법
 
-### ⭐ 방법 1: 독립형 생성기 (추천!)
-**가장 빠르고 간단한 방법**
+### ⭐ 방법 1: Python 스크립트 (추천!)
+**가장 빠르고 간단한 방법 - 로컬 또는 서버에서 바로 실행**
 
 ```bash
-jupyter notebook standalone_evaluation_generator.ipynb
+# API 키 환경변수 설정
+export OPENAI_API_KEY=your-api-key-here
+
+# 실행 (5000개 샘플)
+python standalone_evaluation_generator.py --num-samples 5000
+
+# 또는 API 키를 직접 지정
+python standalone_evaluation_generator.py --api-key sk-proj-... --num-samples 5000
+
+# 테스트 (100개)
+python standalone_evaluation_generator.py --num-samples 100
 ```
 
 ✅ **장점:**
+- 코랩보다 빠름 (로컬/서버 실행)
 - RFP 파일 생성 불필요
 - GPT가 직접 RFP 요구사항과 제안서 내용 생성
-- API 키만 입력하면 즉시 실행 가능
+- 커맨드라인에서 바로 실행 가능
 - 100개 샘플: 1-2분, 5,000개: 50-70분
 
 📁 **출력:** `evaluation_training_data/evaluation_dataset_5000_YYYYMMDD_HHMMSS.jsonl`
 
 ---
 
-### 방법 2: 2단계 생성 (RFP 파일 필요)
+### 방법 2: Jupyter Notebook (코랩)
+**구글 코랩에서 실행**
+
+```bash
+jupyter notebook standalone_evaluation_generator.ipynb
+```
+
+✅ **장점:**
+- 구글 코랩에서 실행 가능
+- 단계별로 확인하며 실행
+- API 키만 입력하면 즉시 실행 가능
+
+📁 **출력:** `evaluation_training_data/evaluation_dataset_5000_YYYYMMDD_HHMMSS.jsonl`
+
+---
+
+### 방법 3: 2단계 생성 (RFP 파일 필요)
 **RFP와 제안서 파일도 함께 필요한 경우**
 
 ## 📋 실행 순서 (중요!)
@@ -66,12 +93,13 @@ jupyter notebook evaluation_dataset_generator.ipynb
 
 ```
 dummy_data_generator/
-├── standalone_evaluation_generator.ipynb # ⭐ 독립형: 평가 데이터 생성 (추천)
+├── standalone_evaluation_generator.py    # ⭐ Python 스크립트: 평가 데이터 생성 (추천!)
+├── standalone_evaluation_generator.ipynb # Jupyter Notebook 버전
 ├── rfp_proposal_generator.ipynb          # 1단계: RFP/제안서 생성
 ├── evaluation_dataset_generator.ipynb    # 2단계: 평가 데이터 생성
 ├── EXAMPLE_OUTPUT.jsonl                  # 출력 예시
 ├── README.md                             # 이 파일
-├── generated_rfp_proposals/              # 1단계 출력 (방법 2)
+├── generated_rfp_proposals/              # 1단계 출력 (방법 3)
 │   ├── rfp_001_of50.json
 │   ├── proposal_rfp001_01of06_score085.json
 │   └── ...
@@ -81,9 +109,27 @@ dummy_data_generator/
 
 ---
 
-## 🚀 빠른 시작 (구글 코랩)
+## 🚀 빠른 시작
 
-### ⭐ 방법 1: 독립형 생성기 (가장 간단!)
+### ⭐ Python 스크립트 (가장 빠름!)
+```bash
+# 필수 라이브러리 설치
+pip install openai tqdm
+
+# API 키 설정
+export OPENAI_API_KEY=sk-...
+
+# 테스트 (1-2분)
+python standalone_evaluation_generator.py --num-samples 100
+
+# 본격 실행 (50-70분)
+python standalone_evaluation_generator.py --num-samples 5000
+
+# 기존 데이터 분석만
+python standalone_evaluation_generator.py --analyze-only
+```
+
+### Jupyter Notebook (코랩)
 ```python
 # standalone_evaluation_generator.ipynb에서
 OPENAI_API_KEY = "sk-..."  # API 키 입력
@@ -95,7 +141,7 @@ samples = generate_evaluation_dataset(num_samples=100)
 samples = generate_evaluation_dataset(num_samples=5000)
 ```
 
-### 방법 2: 2단계 생성
+### 2단계 생성 (방법 3)
 
 #### 1단계 실행
 ```python
