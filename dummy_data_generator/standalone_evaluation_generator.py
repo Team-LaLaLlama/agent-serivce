@@ -8,11 +8,12 @@
 - JSONL 형식: Fine-tuning에 바로 사용 가능한 형식
 
 사용법:
-    python standalone_evaluation_generator.py --api-key YOUR_API_KEY --num-samples 5000
-
-    또는 환경변수로:
+    # 환경변수로 API 키 설정
     export OPENAI_API_KEY=your-api-key-here
-    python standalone_evaluation_generator.py --num-samples 5000
+    python standalone_evaluation_generator.py --num-samples 1000
+
+    # 또는 커맨드라인에서 직접 지정
+    python standalone_evaluation_generator.py --api-key YOUR_KEY --num-samples 1000
 """
 
 import json
@@ -20,9 +21,10 @@ import os
 import random
 import argparse
 import glob
+import asyncio
 from datetime import datetime
-from openai import OpenAI
-from tqdm import tqdm
+from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
 
 
 # IT 프로젝트 도메인 (5개 분야)
@@ -145,9 +147,9 @@ def generate_score_by_distribution():
         return random.uniform(0.30, 0.49)  # 30-49%: 10%
 
 
-def generate_evaluation_sample(client):
+async def generate_evaluation_sample(client):
     """
-    단일 평가 샘플 생성 (instruction-input-output)
+    단일 평가 샘플 생성 (instruction-input-output) - 비동기 버전
     """
     # 랜덤하게 IT 도메인 선택
     domain = random.choice(IT_DOMAINS)
@@ -173,54 +175,25 @@ def generate_evaluation_sample(client):
     score_ratio = generate_score_by_distribution()
     target_score = int(max_score * score_ratio)
 
-    # GPT에게 RFP 요구사항 + 제안서 내용 + 평가 생성 요청
-    prompt = f"""
-당신은 IT 프로젝트 제안서 평가 데이터 생성 전문가입니다.
+    # 간결한 프롬프트
+    prompt = f"""IT 프로젝트 제안서 평가 샘플 생성:
+- 프로젝트: {project_type} ({domain})
+- 평가항목: {eval_type} (만점 {max_score}점)
+- 목표점수: {target_score}점
 
-다음 조건으로 평가 샘플을 생성해주세요:
+JSON 형식으로 출력:
+{{"rfp_요구사항": "2문장", "제안서_내용": "2문장 (점수 {target_score}점 수준)", "점수": {target_score}, "코멘트": "2문장 평가"}}
 
-**프로젝트 정보:**
-- IT 도메인: {domain}
-- 프로젝트 유형: {project_type}
-
-**평가 정보:**
-- 평가 항목: {eval_type}
-- 평가 설명: {eval_description}
-- 목표 점수: {target_score}/{max_score}점
-
-**생성할 내용:**
-1. **RFP 요구사항**: {project_type}에 대한 현실적인 요구사항 (2-3문장)
-2. **제안서 내용**: 위 RFP에 대한 제안서 내용 (2-3문장)
-   - {target_score}/{max_score}점을 받을 만한 수준으로 작성
-   - 점수가 낮으면 문제점 포함, 높으면 우수한 내용 포함
-3. **평가 코멘트**: RFP 요구사항 대비 제안서의 충족도 평가 (2-3문장)
-   - 구체적인 근거 제시
-   - {eval_description} 관점에서 평가
-
-**출력 형식 (JSON):**
-{{
-  "rfp_요구사항": "RFP 요구사항 내용",
-  "제안서_내용": "제안서 내용",
-  "점수": {target_score},
-  "코멘트": "평가 코멘트"
-}}
-
-**중요 제약:**
-1. 점수는 정확히 {target_score}점이어야 합니다 (만점: {max_score}점)
-2. RFP와 제안서는 서로 연관되어야 합니다
-3. 평가 코멘트는 RFP 요구사항을 구체적으로 언급해야 합니다
-4. IT 도메인({domain})에 맞는 현실적인 내용이어야 합니다
-5. 모든 내용은 격식 있는 제안서 문체로 작성하세요
-"""
+{target_score}점 수준: {"우수" if target_score >= 80 else "미흡" if target_score < 50 else "보통"}"""
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = await client.chat.completions.create(
+            model="gpt-3.5-turbo",  # 더 빠르고 저렴한 모델
             messages=[
-                {"role": "system", "content": "당신은 IT 프로젝트 제안서 평가 데이터 생성 전문가입니다. 항상 유효한 JSON 형식으로만 응답합니다."},
+                {"role": "system", "content": "IT 제안서 평가 데이터 생성. JSON만 출력."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.8,
+            temperature=0.7,
             response_format={"type": "json_object"}
         )
 
@@ -239,49 +212,57 @@ def generate_evaluation_sample(client):
         }
 
     except Exception as e:
-        print(f"샘플 생성 실패: {e}")
         return None
 
 
-def generate_evaluation_dataset(client, num_samples=5000, output_dir="evaluation_training_data"):
+async def generate_evaluation_dataset(client, num_samples=5000, output_dir="evaluation_training_data", batch_size=20):
     """
-    평가 데이터셋을 생성합니다.
+    평가 데이터셋을 생성합니다 (병렬 처리).
 
     Args:
-        client: OpenAI client
+        client: AsyncOpenAI client
         num_samples: 생성할 샘플 수
         output_dir: 출력 디렉토리
+        batch_size: 동시 처리할 샘플 수 (기본 20)
     """
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*70}")
-    print(f"평가 데이터셋 생성 시작: {num_samples}개 샘플")
-    print(f"예상 소요 시간: 약 {num_samples * 0.8 / 60:.0f}-{num_samples * 1.2 / 60:.0f}분")
+    print(f"평가 데이터셋 생성 시작: {num_samples}개 샘플 (병렬처리: {batch_size}개씩)")
+    print(f"모델: gpt-3.5-turbo (빠르고 저렴)")
+    print(f"예상 소요 시간: 약 {num_samples * 0.1 / 60:.0f}-{num_samples * 0.15 / 60:.0f}분")
     print(f"{'='*70}\n")
 
     samples = []
-    failed_count = 0
 
-    for i in tqdm(range(num_samples), desc="샘플 생성 중"):
-        sample = generate_evaluation_sample(client)
+    # 배치 단위로 병렬 처리
+    for i in range(0, num_samples, batch_size):
+        batch_count = min(batch_size, num_samples - i)
 
-        if sample is not None:
-            samples.append(sample)
-        else:
-            failed_count += 1
+        # 병렬로 샘플 생성
+        tasks = [generate_evaluation_sample(client) for _ in range(batch_count)]
+        batch_results = await asyncio.gather(*tasks)
+
+        # 성공한 샘플만 추가
+        for result in batch_results:
+            if result is not None:
+                samples.append(result)
+
+        # 진행상황 출력
+        if (i + batch_count) % 100 == 0 or i + batch_count == num_samples:
+            print(f"진행: {len(samples)}/{num_samples} 완료")
 
         # 중간 저장 (1000개마다)
-        if (i + 1) % 1000 == 0 and len(samples) > 0:
-            temp_filename = f"{output_dir}/evaluation_dataset_temp_{i+1}.jsonl"
+        if len(samples) % 1000 == 0 and len(samples) > 0:
+            temp_filename = f"{output_dir}/evaluation_dataset_temp_{len(samples)}.jsonl"
             with open(temp_filename, 'w', encoding='utf-8') as f:
-                start_idx = max(0, len(samples) - 1000)
-                for s in samples[start_idx:]:
+                for s in samples[-1000:]:
                     f.write(json.dumps(s, ensure_ascii=False) + '\n')
-            print(f"\n✅ 중간 저장: {temp_filename} ({len(samples)}개 완료)")
+            print(f"✅ 중간 저장: {temp_filename}")
 
     # 최종 저장
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{output_dir}/evaluation_dataset_{num_samples}_{timestamp}.jsonl"
+    output_filename = f"{output_dir}/evaluation_dataset_{len(samples)}_{timestamp}.jsonl"
 
     with open(output_filename, 'w', encoding='utf-8') as f:
         for sample in samples:
@@ -290,7 +271,7 @@ def generate_evaluation_dataset(client, num_samples=5000, output_dir="evaluation
     print(f"\n{'='*70}")
     print(f"✅ 데이터셋 생성 완료!")
     print(f"  - 성공: {len(samples)}개")
-    print(f"  - 실패: {failed_count}개")
+    print(f"  - 실패: {num_samples - len(samples)}개")
     print(f"  - 출력 파일: {output_filename}")
     print(f"{'='*70}\n")
 
@@ -385,7 +366,7 @@ def analyze_dataset(output_dir="evaluation_training_data"):
         print(f"30-49점:  목표 10% / 실제 {score_ranges['30-49점']/total*100:.1f}%")
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(
         description="독립형 제안서 평가 데이터셋 생성기",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -401,11 +382,11 @@ def main():
   # 테스트 (100개)
   python standalone_evaluation_generator.py --num-samples 100
 
-권장 샘플 수:
-  - 테스트: 100개 (1-2분)
-  - 최소: 1,000개 (10-15분)
-  - 권장: 5,000개 (50-70분)
-  - 이상적: 10,000개 (100-140분)
+권장 샘플 수 (병렬처리로 10배 이상 빠름):
+  - 테스트: 100개 (약 1분)
+  - 최소: 1,000개 (약 2분)
+  - 권장: 5,000개 (약 8분)
+  - 이상적: 10,000개 (약 15분)
         """
     )
 
@@ -436,6 +417,13 @@ def main():
         help='데이터셋 생성 없이 기존 데이터 분석만 수행'
     )
 
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=20,
+        help='동시 처리할 샘플 수 (기본값: 20, 높을수록 빠르지만 API 제한 주의)'
+    )
+
     args = parser.parse_args()
 
     # API 키 확인
@@ -453,19 +441,20 @@ def main():
         analyze_dataset(args.output_dir)
         return
 
-    # OpenAI 클라이언트 초기화
-    client = OpenAI(api_key=api_key)
+    # OpenAI 클라이언트 초기화 (비동기)
+    client = AsyncOpenAI(api_key=api_key)
 
     print(f"✅ 환경 설정 완료!")
     print(f"  - IT 도메인: {len(IT_DOMAINS)}개")
     print(f"  - 평가 유형: {len(EVALUATION_TYPES)}개")
     print(f"  - 출력 디렉토리: {args.output_dir}")
 
-    # 데이터셋 생성
-    samples, output_file = generate_evaluation_dataset(
+    # 데이터셋 생성 (비동기)
+    samples, output_file = await generate_evaluation_dataset(
         client,
         num_samples=args.num_samples,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        batch_size=args.batch_size
     )
 
     # 생성된 데이터셋 분석
@@ -474,4 +463,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
