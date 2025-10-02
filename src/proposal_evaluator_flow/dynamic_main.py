@@ -391,7 +391,7 @@ def get_llm_model():
     model_type = os.getenv('LLM_TYPE', 'local').lower()
     
     if model_type == 'local':
-        model_name = os.getenv('LOCAL_MODEL_NAME', 'llama3.2')
+        model_name = os.getenv('LOCAL_MODEL_NAME', 'llama-blossom')
         base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
         print(f"INFO: 로컬 LLM 사용 - 모델: {model_name}, URL: {base_url}")
         return LLM(model=f"ollama/{model_name}", base_url=base_url)

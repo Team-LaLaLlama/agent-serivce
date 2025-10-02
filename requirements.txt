@@ -108,8 +108,6 @@ portalocker==2.7.0
 posthog==5.4.0
 prompt_toolkit==3.0.52
 propcache==0.3.2
-# Editable install with no version control (proposal_evaluator_flow==0.1.0)
--e c:\users\admin\metalama\team\proposal_evaluator_flow
 protobuf==6.32.1
 pure_eval==0.2.3
 pyarrow==21.0.0
