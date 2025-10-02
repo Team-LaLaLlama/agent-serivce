@@ -252,11 +252,11 @@ async def generate_evaluation_dataset(client, num_samples=5000, output_dir="eval
         if (i + batch_count) % 100 == 0 or i + batch_count == num_samples:
             print(f"진행: {len(samples)}/{num_samples} 완료")
 
-        # 중간 저장 (1000개마다)
-        if len(samples) % 1000 == 0 and len(samples) > 0:
+        # 중간 저장 (100개마다)
+        if len(samples) % 100 == 0 and len(samples) > 0:
             temp_filename = f"{output_dir}/evaluation_dataset_temp_{len(samples)}.jsonl"
             with open(temp_filename, 'w', encoding='utf-8') as f:
-                for s in samples[-1000:]:
+                for s in samples[-100:]:
                     f.write(json.dumps(s, ensure_ascii=False) + '\n')
             print(f"✅ 중간 저장: {temp_filename}")
 
