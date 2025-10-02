@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
 from crewai.llm import LLM
 from bs4 import BeautifulSoup
+from functools import partial   ### 🔧 FIX: partial import (trace 저장시 회사명 전달)
 
 # LangChain 관련 라이브러리 임포트
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -29,10 +30,13 @@ RFP_PATH = "./RFP/수협_rfp.pdf"
 OUTPUT_DIR = "./output"
 EVALUATION_CRITERIA_PATH = "./standard/evaluation_criteria.md"
 CHROMA_PERSIST_DIR = "./chroma_db_html_parsed"
+INTERNAL_DATA_DIR = "./internal_data"  # 사내 정보 디렉토리 (기술스택, 담당자, 마이그레이션, 장애이력 등)
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 
 # --- 전역 변수 ---
 unified_vectorstore = None
+company_map = {}   # {"A사_제안서": "A사"} 형태
+llm = None         ### 🔧 FIX: llm 전역변수 명시적으로 선언
 
 # =================================================================
 # HTML 청킹 함수 (RAG_pipeline.ipynb에서 가져옴)
@@ -121,6 +125,72 @@ def chunk_html_recursively(html_content, proposal_id, max_chunk_size=1000, chunk
     return chunks
 
 # =================================================================
+# 사내 정보 로더 함수
+# =================================================================
+
+def load_all_internal_data_simple(internal_data_dir):
+    """
+    사내 정보 디렉토리의 모든 파일을 간단하게 로드하는 함수
+
+    정형/비정형 구분 없이 모든 .txt 파일을 Document로 변환하여 로드합니다.
+    각 파일은 통째로 하나의 Document가 되며, 파일명에서 문서 타입을 자동 추론합니다.
+
+    Args:
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+
+    Returns:
+        list[Document]: 모든 사내 정보 Document 리스트
+    """
+    all_internal_docs = []
+
+    if not os.path.exists(internal_data_dir):
+        print(f"  ⚠ 사내 정보 디렉토리가 존재하지 않습니다: {internal_data_dir}")
+        return all_internal_docs
+
+    print(f"\n[사내 정보 로드 시작: {internal_data_dir}]")
+
+    # 디렉토리 내 모든 .txt 파일 검색
+    internal_files = glob.glob(os.path.join(internal_data_dir, "*.txt"))
+
+    for file_path in internal_files:
+        filename = os.path.basename(file_path)
+
+        try:
+            # 파일 내용 전체를 읽기
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 파일명에서 문서 타입 자동 분류
+            if 'tech_stack' in filename.lower():
+                doc_type = "사내_기술스택"
+            elif 'contact' in filename.lower():
+                doc_type = "사내_담당자"
+            elif 'migration' in filename.lower():
+                doc_type = "사내_마이그레이션"
+            elif 'incident' in filename.lower():
+                doc_type = "사내_장애이력"
+            else:
+                doc_type = "사내_기타"
+
+            # Document 생성 (파일 전체를 하나의 Document로)
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "doc_type": doc_type,
+                    "source_file": filename
+                }
+            )
+            all_internal_docs.append(doc)
+            print(f"  ✓ [{doc_type}] {filename} 로드 완료 ({len(content)} 자)")
+
+        except Exception as e:
+            print(f"  ✗ {filename} 로드 실패: {e}")
+            continue
+
+    print(f"\n✅ 총 {len(all_internal_docs)}개의 사내 정보 파일 로드 완료\n")
+    return all_internal_docs
+
+# =================================================================
 # RAG 초기화 함수
 # =================================================================
 
@@ -178,12 +248,43 @@ def create_unified_vectorstore(proposal_files, rfp_path, embedding_model):
             proposal_id = os.path.splitext(os.path.basename(file_path))[0]
             with open(file_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-            
+
             proposal_chunks = chunk_html_recursively(html_content, proposal_id)
             all_chunked_data.extend(proposal_chunks)
             print(f"  ✓ 제안서 '{proposal_id}' 처리 완료: {len(proposal_chunks)}개 청크 생성")
         except Exception as e:
             print(f"  ✗ 제안서 '{os.path.basename(file_path)}' 처리 중 오류: {e}")
+
+    # 3. 사내 정보 로드 (기술스택, 담당자, 마이그레이션 이력, 장애 이력 등)
+    print("\n[사내 정보 처리]")
+    internal_docs = load_all_internal_data_simple(INTERNAL_DATA_DIR)
+
+    # 사내 정보를 청크 형태로 변환 (기존 구조와 통일)
+    for idx, doc in enumerate(internal_docs):
+        doc_type = doc.metadata.get("doc_type", "사내_기타")
+        source_file = doc.metadata.get("source_file", "unknown")
+
+        # 내용이 긴 경우 적절히 분할 (max 1000자)
+        content = doc.page_content
+        if len(content) > 1000:
+            # 1000자 단위로 분할 (오버랩 100자)
+            chunks = split_text_by_length(content, 1000, 100)
+            for chunk_idx, chunk in enumerate(chunks):
+                all_chunked_data.append({
+                    "proposal_id": f"internal_{doc_type}",
+                    "source_id": f"internal_{source_file}_{idx}_{chunk_idx}",
+                    "heading_context": f"{doc_type} > {source_file}",
+                    "original_text": chunk
+                })
+        else:
+            all_chunked_data.append({
+                "proposal_id": f"internal_{doc_type}",
+                "source_id": f"internal_{source_file}_{idx}",
+                "heading_context": f"{doc_type} > {source_file}",
+                "original_text": content
+            })
+
+    print(f"  ✓ 사내 정보 {len(internal_docs)}개 파일을 청크로 변환 완료")
 
     if not all_chunked_data:
         print("\n벡터 DB에 저장할 데이터가 없습니다.")
@@ -283,6 +384,10 @@ def save_evaluation_report(proposal_name, report_content):
 
 def get_llm_model():
     """환경변수에 따라 LLM 모델을 선택합니다."""
+    global llm
+    if llm is not None:
+        return llm
+
     model_type = os.getenv('LLM_TYPE', 'local').lower()
     
     if model_type == 'local':
@@ -301,18 +406,33 @@ def get_llm_model():
     
     else:
         raise ValueError(f"지원하지 않는 LLM 타입입니다: {model_type}")
+    
+    return llm
 
 async def main():
     print("## LLM 주도형 동적 Agent 생성 및 평가 프로세스를 시작합니다.")
     
     # RAG 파이프라인 초기화
-    global unified_vectorstore
+    global unified_vectorstore, company_map
     proposal_files = glob.glob(os.path.join(PROPOSAL_DIR, "*.html"))
     
     if not proposal_files or not os.path.exists(RFP_PATH):
         print("오류: 제안서 또는 RFP 파일이 없습니다. 경로를 확인하세요.")
         return
     
+    # 회사명 매핑 테이블 생성
+    company_map = {}
+    for file_path in proposal_files:
+        proposal_name = os.path.splitext(os.path.basename(file_path))[0]
+        # 파일명에서 회사명 추출 (예: "A사_제안서" -> "A사")
+        if "_" in proposal_name:
+            company_name = proposal_name.split("_")[0]
+        else:
+            company_name = proposal_name
+        company_map[proposal_name] = company_name
+        print(f"INFO: 회사 매핑 - {proposal_name} -> {company_name}")
+    
+
     # 벡터스토어 로드 또는 생성
     if os.path.exists(CHROMA_PERSIST_DIR):
         print(f"\n기존 벡터 DB를 '{CHROMA_PERSIST_DIR}' 경로에서 불러옵니다...")
@@ -388,7 +508,12 @@ async def main():
         agent=dispatcher_agent
     )
 
-    dispatcher_crew = Crew(agents=[dispatcher_agent], tasks=[dispatcher_task], verbose=False)
+    dispatcher_crew = Crew(
+        agents=[dispatcher_agent], 
+        tasks=[dispatcher_task], 
+        verbose=False,
+        task_callback=partial(task_callback, company="Dispatcher")
+    )
     categorization_result = dispatcher_crew.kickoff()
     
     try:
@@ -512,10 +637,15 @@ async def main():
         print(f"\n총 {len(specialist_agents)}개의 전문가 Agent가 생성되었습니다.")
         print(f"총 {len(evaluation_tasks)}개의 평가 Task가 생성되었습니다.")
 
+        # 현재 회사명으로 task_callback 생성
+        current_company = company_map.get(proposal_name, "Unknown")
+        current_task_callback = partial(task_callback, company=current_company)
+        
         evaluation_crew = Crew(
             agents=specialist_agents,
             tasks=evaluation_tasks,
-            verbose=False
+            verbose=False,
+            task_callback=current_task_callback
         )
         final_results = await evaluation_crew.kickoff_async()
 
@@ -552,18 +682,18 @@ async def main():
             print(f"  ⚠️⚠️ 경고: 부문별 보고서 총합이 {len(individual_reports_text)}자로 여전히 깁니다!")
             print(f"  → 각 부문을 500자로 추가 제한합니다.")
             individual_reports = [report[:500] + "..." for report in individual_reports]
-            individual_reports_text = "\n\n".join(individual_reports)
-            print(f"  → 최종 길이: {len(individual_reports_text)}자")
+        individual_reports_text = "\n\n".join(individual_reports)
+        print(f"  → 최종 길이: {len(individual_reports_text)}자")
 
         reporting_agent = Agent(
             role="수석 평가 분석가",
             goal="부문별 평가를 종합하여 경영진이 의사결정에 활용할 수 있는 완성된 최종 보고서 작성",
             backstory="""당신은 20년 경력의 수석 분석가로, 핵심을 파악하고 전략적 인사이트를 
             제공하는 능력이 뛰어나며, 의사결정자들이 신뢰하는 분석가입니다.""",
-            llm=llm, 
+            llm=get_llm_model(), 
             verbose=True
         )
-        
+
         reporting_task = Task(
             description=f"""'{proposal_name}' 제안서에 대한 부문별 평가를 종합하여 
 최종 평가 보고서를 작성하세요.
@@ -626,7 +756,16 @@ async def main():
             agent=reporting_agent
         )
         
-        reporting_crew = Crew(agents=[reporting_agent], tasks=[reporting_task], verbose=False)
+        # 현재 회사명으로 task_callback 생성
+        current_company = company_map.get(proposal_name, "Unknown")
+        current_task_callback = partial(task_callback, company=current_company)
+        
+        reporting_crew = Crew(
+            agents=[reporting_agent], 
+            tasks=[reporting_task], 
+            verbose=False,
+            task_callback=current_task_callback
+        )
         final_comprehensive_report = reporting_crew.kickoff()
 
         print(f"\n\n[FINAL REPORT] [{proposal_name}] 최종 종합 평가 보고서")
@@ -638,9 +777,228 @@ async def main():
         save_evaluation_report(proposal_name, final_comprehensive_report.raw)
 
 
+# =================================================================
+# 6. 기업별 Trace 저장 함수
+# =================================================================
+
+def save_task_trace(company: str, task_info: dict):
+    """기업별로 task trace를 저장합니다."""
+    trace_dir = os.path.join("traces", company)
+    os.makedirs(trace_dir, exist_ok=True)
+    filepath = os.path.join(trace_dir, "task_log.ndjson")
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(task_info, ensure_ascii=False) + "\n")
+
+def task_callback(task_output, company="Unknown"):
+    """각 작업 완료 시 결과를 로깅하는 콜백 (기업별 저장)"""
+    global company_map
+    
+    task_info = {
+        "type": "task_completed",
+        "task_name": getattr(task_output, "name", None),
+        "agent": str(getattr(task_output, "agent", None)),
+        "status": "completed",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    
+    # 기업별 trace 저장
+    save_task_trace(company, task_info)
+
+# =================================================================
+# 7. 챗봇 관련 함수들 (main_jy.py에서 가져옴)
+# =================================================================
+def normalize_company_name(extracted: str) -> str:   ### 🔧 FIX: 중복 정의 제거 후 최종 버전
+    """추출된 회사명을 proposal_id로 변환, 없으면 all"""
+    if not extracted or extracted=="all":
+        return "all"
+    extracted_clean = extracted.replace(" ","")
+    for pid, cname in company_map.items():
+        if extracted_clean in cname.replace(" ",""):
+            return pid
+    return "all"
+
+
+def classify_question(user_question: str) -> dict:
+    router_agent = Agent(
+        role="질문 분류 전문가",
+        goal="사용자 질문을 정확히 분류하여 intent (회사 내부 정보, 평가 관련, 일반 질문) 결정, 회사명 추출출",
+        backstory="당신은 질문을 분석하여 정확한 카테고리로 분류하는 전문가입니다. 회사 내부 정보, 평가 관련, 일반 질문을 정확히 구분할 수 있습니다.",
+        llm=get_llm_model(),
+        verbose=True
+    )
+    router_task = Task(
+        description=f"""
+다음 질문을 분석하여 정확한 카테고리로 분류하세요:
+
+질문: "{user_question}"
+
+분류 기준:
+1. "company_db": 회사 내부 정보 (부서, 기술스택, 담당자, 조직도 등)
+2. "evaluation": 제안서 평가 관련 (점수, 근거, 보고서, 평가 결과 등)
+3. "other": 위 두 가지에 해당하지 않는 일반 질문
+
+회사명 추출:
+- 평가 관련 질문에서 회사명이 언급되면 추출
+- 없으면 "all"
+
+반드시 다음 JSON 형식으로만 답변하세요:
+{{
+  "intent": "company_db",
+  "company": "A사"
+}}
+        """,
+        expected_output="JSON 객체 (intent와 company 키 포함)",
+        agent=router_agent
+    )
+    crew = Crew(agents=[router_agent],tasks=[router_task],verbose=False)
+    result = crew.kickoff()
+    try:
+        # JSON 추출 및 파싱
+        raw_text = str(result.raw)
+        if "```json" in raw_text:
+            start = raw_text.find("```json") + 7
+            end = raw_text.find("```", start)
+            json_text = raw_text[start:end].strip()
+        elif "```" in raw_text:
+            start = raw_text.find("```") + 3
+            end = raw_text.find("```", start)
+            json_text = raw_text[start:end].strip()
+        else:
+            start = raw_text.find('{')
+            end = raw_text.rfind('}') + 1
+            json_text = raw_text[start:end]
+        
+        parsed = json.loads(json_text)
+        return parsed
+    except Exception as e:
+        print(f"JSON 파싱 오류: {e}")
+        return {"intent":"other","company":"all"}
+
+
+def search_company_db(user_question: str) -> str:
+    """벡터스토어에서 사내 정보를 검색하여 답변합니다."""
+    global unified_vectorstore
+
+    if unified_vectorstore is None:
+        return "오류: 벡터스토어가 초기화되지 않았습니다. 먼저 평가를 실행해주세요."
+
+    # 벡터스토어에서 사내 정보 검색 (사내_로 시작하는 proposal_id 필터링)
+    try:
+        # 모든 사내 정보 타입에서 검색
+        all_results = []
+        internal_types = ["사내_기술스택", "사내_담당자", "사내_마이그레이션", "사내_장애이력", "사내_기타"]
+
+        for doc_type in internal_types:
+            results = unified_vectorstore.similarity_search(
+                query=user_question,
+                k=3,
+                filter={"proposal_id": f"internal_{doc_type}"}
+            )
+            all_results.extend(results)
+
+        if not all_results:
+            return "관련된 사내 정보를 찾을 수 없습니다."
+
+        # 검색 결과를 컨텍스트로 변환
+        context = "\n\n".join([doc.page_content for doc in all_results[:5]])  # 상위 5개만 사용
+
+        prompt = f"""
+사용자 질문: "{user_question}"
+
+회사 내부 정보:
+{context}
+
+위 정보를 바탕으로 정확하고 도움이 되는 답변을 해주세요.
+- 구체적인 정보를 명시하세요
+- 간결하고 명확하게 답변하세요
+- 관련 없는 정보는 제외하세요
+"""
+        return get_llm_model().call(prompt)
+
+    except Exception as e:
+        return f"사내 정보 검색 중 오류 발생: {e}"
+
+# ================================================================
+# Evaluation 질문 처리
+# ================================================================
+def load_evaluation_trace(company: str):
+    filepath = os.path.join("traces", company, "task_log.ndjson")
+    if not os.path.exists(filepath):
+        return []
+    with open(filepath, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def answer_evaluation_question(user_question: str, company="all") -> str:
+    if company == "all":
+        companies = list(company_map.keys())
+    else:
+        companies = [company]
+    
+    context = ""
+    for comp in companies:
+        traces = load_evaluation_trace(comp)
+        for t in traces[:5]:
+            task_name = t.get('task_name', 'Unknown')
+            status = t.get('status', 'Unknown')
+            context += f"- {task_name}: {status}\n"
+    
+    if not context:
+        return f"현재 {company} 회사의 평가 데이터가 없습니다. 먼저 제안서 평가를 실행해주세요."
+    
+    prompt = f"""
+사용자 질문: "{user_question}"
+
+평가 기록 데이터:
+{context}
+
+위 평가 기록을 바탕으로 정확하고 도움이 되는 답변을 해주세요.
+- 실제 평가 결과를 인용하여 답변하세요
+- 구체적인 점수나 근거가 있다면 명시하세요
+- 간결하고 명확하게 답변하세요
+"""
+    return get_llm_model().call(prompt)
+
+def answer_general_question(user_question: str) -> str:
+    prompt = f"""
+사용자 질문: "{user_question}"
+
+위 질문에 대해 정확하고 도움이 되는 답변을 해주세요.
+- 간결하고 명확하게 답변하세요
+- 관련 없는 정보는 제외하세요
+- 정확한 정보를 제공하세요
+"""
+    return get_llm_model().call(prompt)
+
+
 def run_main():
     """동기적으로 main 함수를 실행합니다."""
     asyncio.run(main())
 
+def run_chatbot_test():
+    print("================================")
+    print("ChatBot 테스트")
+    print("================================")
+    test_questions = [
+        "우리 회사에서 Kafka 쓰는 부서가 있어?",
+        "왜 A사의 기술 점수는 8점이야?", 
+        "오늘 날씨 어때?",
+        "개발팀에서 뭐 쓰고 있어?",
+        "React 사용하는 팀이 어디야?",
+        "A사의 기술 점수 근거를 알려줘",
+    ]
+    
+    for q in test_questions:
+        result = classify_question(q)
+        intent, company = result.get("intent"), result.get("company", "all")
+        print(f"\nQ: {q}\n분류: {result}")
+        if intent == "company_db":
+            print("A:", search_company_db(q))
+        elif intent == "evaluation":
+            comp_id = normalize_company_name(company)
+            print("A:", answer_evaluation_question(q, comp_id))
+        else:
+            print("A:", answer_general_question(q))
+
 if __name__ == '__main__':
     run_main()
+    run_chatbot_test()

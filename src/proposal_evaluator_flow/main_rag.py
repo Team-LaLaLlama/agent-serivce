@@ -17,6 +17,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document  # 사내 정보 Document 생성용
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ PROPOSAL_DIR = "./proposal"
 RFP_PATH = "./RFP/수협_rfp.txt"
 OUTPUT_DIR = "./output"
 EVALUATION_CRITERIA_PATH = "./standard/evaluation_criteria.md"
+INTERNAL_DATA_DIR = "./internal_data"  # 사내 정보 디렉토리 (기술스택, 담당자, 마이그레이션, 장애이력 등)
 
 # --- 전역 변수 ---
 # 생성된 벡터스토어를 저장할 전역 변수
@@ -66,6 +68,15 @@ def load_document(file_path, doc_type, proposal_name):
     if file_path.endswith('.txt'):
         loader = TextLoader(file_path, encoding='utf-8')
         docs = loader.load()
+        # 각 Document에 메타데이터 추가
+        for doc in docs:
+            doc.metadata.update({"doc_type": doc_type, "proposal_name": proposal_name})
+        documents.extend(docs)
+
+    # HTML 파일 로드 (추가)
+    elif file_path.endswith('.html'):
+        loader = TextLoader(file_path, encoding='utf-8')
+        docs = loader.load()
         for doc in docs:
             doc.metadata.update({"doc_type": doc_type, "proposal_name": proposal_name})
         documents.extend(docs)
@@ -73,33 +84,258 @@ def load_document(file_path, doc_type, proposal_name):
     print(f"    → {len(documents)}개 섹션 로드됨")
     return documents
 
-def create_unified_vectorstore(proposal_files, rfp_path, embedding_model, chroma_client, collection_name="proposal_evaluation_store"):
-    """모든 제안서와 RFP 문서를 단일 벡터 스토어로 변환"""
-    print(f"\n--- [RAG Setup] 통합 벡터스토어 생성을 시작합니다 (Collection: {collection_name}) ---")
-    
+
+# =================================================================
+# 사내 정보 로더 함수들
+# =================================================================
+
+def load_internal_structured_data(file_path, doc_type_prefix):
+    """
+    정형화된 사내 정보 데이터를 로드하는 함수
+
+    데이터 형식: '---'로 구분된 항목들
+    각 항목은 key: value 형식의 메타데이터를 포함
+
+    Args:
+        file_path (str): 사내 정보 파일 경로
+        doc_type_prefix (str): 문서 타입 접두사 (예: "사내_기술스택")
+
+    Returns:
+        list[Document]: 로드된 Document 객체 리스트
+    """
+    documents = []
+
+    # 파일이 존재하지 않으면 빈 리스트 반환
+    if not os.path.exists(file_path):
+        print(f"  ⚠ 파일이 존재하지 않습니다: {file_path}")
+        return documents
+
+    print(f"  - [{doc_type_prefix}] '{os.path.basename(file_path)}' 로딩 중...")
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # '---'로 구분된 각 항목을 개별 Document로 변환
+    entries = content.split('---')
+
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:  # 빈 항목은 스킵
+            continue
+
+        # 기본 메타데이터 설정
+        metadata = {"doc_type": doc_type_prefix}
+
+        # 각 줄을 파싱하여 메타데이터 추출
+        # 형식: key: value
+        lines = entry.split('\n')
+        for line in lines:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                # 메타데이터에 키-값 저장 (공백 제거)
+                metadata[key.strip()] = value.strip()
+
+        # Document 생성 (전체 내용을 page_content로, 파싱된 정보는 metadata로)
+        doc = Document(
+            page_content=entry,  # 원본 텍스트 그대로 저장
+            metadata=metadata
+        )
+        documents.append(doc)
+
+    print(f"    → {len(documents)}개 항목 로드됨")
+    return documents
+
+
+def load_all_internal_data(internal_data_dir):
+    """
+    사내 정보 디렉토리의 모든 파일을 자동으로 로드하는 함수
+
+    파일명 규칙:
+    - tech_stacks*.txt → 사내_기술스택
+    - contacts*.txt → 사내_담당자
+    - migrations*.txt → 사내_마이그레이션
+    - incidents*.txt → 사내_장애이력
+
+    Args:
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+
+    Returns:
+        list[Document]: 모든 사내 정보 Document 리스트
+    """
+    all_internal_docs = []
+
+    if not os.path.exists(internal_data_dir):
+        print(f"  ⚠ 사내 정보 디렉토리가 존재하지 않습니다: {internal_data_dir}")
+        return all_internal_docs
+
+    print(f"\n[사내 정보 로드 시작: {internal_data_dir}]")
+
+    # 디렉토리 내 모든 .txt 파일 검색
+    internal_files = glob.glob(os.path.join(internal_data_dir, "*.txt"))
+
+    for file_path in internal_files:
+        filename = os.path.basename(file_path).lower()
+
+        # 파일명에 따라 문서 타입 자동 분류
+        if 'tech_stack' in filename or 'technology' in filename:
+            docs = load_internal_structured_data(file_path, "사내_기술스택")
+            all_internal_docs.extend(docs)
+
+        elif 'contact' in filename or 'person' in filename:
+            docs = load_internal_structured_data(file_path, "사내_담당자")
+            all_internal_docs.extend(docs)
+
+        elif 'migration' in filename:
+            docs = load_internal_structured_data(file_path, "사내_마이그레이션")
+            all_internal_docs.extend(docs)
+
+        elif 'incident' in filename or 'failure' in filename:
+            docs = load_internal_structured_data(file_path, "사내_장애이력")
+            all_internal_docs.extend(docs)
+
+        else:
+            # 분류되지 않은 파일은 일반 사내 정보로 처리
+            docs = load_internal_structured_data(file_path, "사내_기타")
+            all_internal_docs.extend(docs)
+
+    print(f"✅ 총 {len(all_internal_docs)}개의 사내 정보 항목 로드 완료\n")
+    return all_internal_docs
+
+
+def load_all_internal_data_simple(internal_data_dir):
+    """
+    사내 정보 디렉토리의 모든 파일을 간단하게 로드하는 함수
+
+    정형/비정형 구분 없이 모든 .txt 파일을 Document로 변환하여 로드합니다.
+    각 파일은 통째로 하나의 Document가 되며, 파일명에서 문서 타입을 자동 추론합니다.
+
+    Args:
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+
+    Returns:
+        list[Document]: 모든 사내 정보 Document 리스트
+    """
+    all_internal_docs = []
+
+    if not os.path.exists(internal_data_dir):
+        print(f"  ⚠ 사내 정보 디렉토리가 존재하지 않습니다: {internal_data_dir}")
+        return all_internal_docs
+
+    print(f"\n[사내 정보 로드 시작: {internal_data_dir}]")
+
+    # 디렉토리 내 모든 .txt 파일 검색
+    internal_files = glob.glob(os.path.join(internal_data_dir, "*.txt"))
+
+    for file_path in internal_files:
+        filename = os.path.basename(file_path)
+
+        try:
+            # 파일 내용 전체를 읽기
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 파일명에서 문서 타입 자동 분류
+            if 'tech_stack' in filename.lower():
+                doc_type = "사내_기술스택"
+            elif 'contact' in filename.lower():
+                doc_type = "사내_담당자"
+            elif 'migration' in filename.lower():
+                doc_type = "사내_마이그레이션"
+            elif 'incident' in filename.lower():
+                doc_type = "사내_장애이력"
+            else:
+                doc_type = "사내_기타"
+
+            # Document 생성 (파일 전체를 하나의 Document로)
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "doc_type": doc_type,
+                    "source_file": filename
+                }
+            )
+            all_internal_docs.append(doc)
+            print(f"  ✓ [{doc_type}] {filename} 로드 완료 ({len(content)} 자)")
+
+        except Exception as e:
+            print(f"  ✗ {filename} 로드 실패: {e}")
+            continue
+
+    print(f"\n✅ 총 {len(all_internal_docs)}개의 사내 정보 파일 로드 완료\n")
+    return all_internal_docs
+
+
+def create_unified_vectorstore(
+    proposal_files,
+    rfp_path,
+    internal_data_dir,
+    embedding_model,
+    chroma_client,
+    collection_name="proposal_evaluation_store"
+):
+    """
+    제안서, RFP, 사내 정보를 모두 포함하는 통합 벡터스토어를 생성하는 함수
+
+    Args:
+        proposal_files (list): 제안서 파일 경로 리스트
+        rfp_path (str): RFP 파일 경로
+        internal_data_dir (str): 사내 정보 디렉토리 경로
+        embedding_model: HuggingFace 임베딩 모델
+        chroma_client: ChromaDB 클라이언트
+        collection_name (str): 벡터스토어 컬렉션 이름
+
+    Returns:
+        Chroma: 생성된 벡터스토어 객체
+    """
+    print(f"\n{'='*70}")
+    print(f"  통합 벡터스토어 생성 시작 (Collection: {collection_name})")
+    print(f"{'='*70}")
+
     all_documents = []
-    all_documents.extend(load_document(rfp_path, "RFP", "RFP"))
+
+    # 1. RFP 문서 로드
+    print("\n[1단계] RFP 문서 로드")
+    if os.path.exists(rfp_path):
+        all_documents.extend(load_document(rfp_path, "RFP", "RFP"))
+    else:
+        print(f"  ⚠ RFP 파일이 존재하지 않습니다: {rfp_path}")
+
+    # 2. 제안서 문서 로드
+    print("\n[2단계] 제안서 문서 로드")
     for proposal_path in proposal_files:
         proposal_name = os.path.basename(proposal_path)
         all_documents.extend(load_document(proposal_path, "제안서", proposal_name))
-        
+
+    # 3. 사내 정보 로드 (기술스택, 담당자, 마이그레이션 이력, 장애 이력 등)
+    # 모든 파일을 간단하게 로드 (정형/비정형 구분 없이)
+    print("\n[3단계] 사내 정보 로드")
+    internal_docs = load_all_internal_data_simple(internal_data_dir)
+    all_documents.extend(internal_docs)  # 제안서+RFP에 사내 정보 문서 추가
+
     print(f"\n  [OK] 총 {len(all_documents)}개 문서 섹션 로드 완료")
 
+    # 4. 텍스트 분할 (청크 단위로 쪼개기)
+    print("\n[4단계] 텍스트 청크 분할")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
     splits = text_splitter.split_documents(all_documents)
     print(f"  [OK] {len(splits)}개 청크로 분할 완료")
 
+    # 5. 기존 컬렉션 삭제 (있을 경우)
+    print("\n[5단계] 기존 컬렉션 확인 및 삭제")
     try:
         chroma_client.delete_collection(name=collection_name)
         print(f"  [OK] 기존 '{collection_name}' 컬렉션 삭제 완료")
     except Exception:
-        pass
+        print(f"  ℹ️ 기존 컬렉션 없음 (신규 생성)")
 
+    # 6. 벡터스토어 생성 (임베딩 + 인덱싱)
+    print("\n[6단계] 벡터 임베딩 및 인덱싱")
+    print(f"  ⏳ {len(splits)}개 청크를 임베딩 중... (수 분 소요)")
     vectorstore = Chroma.from_documents(
-        documents=splits,
-        embedding=embedding_model,
-        collection_name=collection_name,
-        client=chroma_client
+        documents=splits,              # 청크 분할된 Document 리스트
+        embedding=embedding_model,     # 임베딩 모델
+        collection_name=collection_name,  # 컬렉션 이름
+        client=chroma_client          # ChromaDB 클라이언트
     )
     print("  [OK] 통합 벡터스토어 생성 완료!")
     return vectorstore
@@ -107,22 +343,28 @@ def create_unified_vectorstore(proposal_files, rfp_path, embedding_model, chroma
 def get_context_for_topic(proposal_file, topic):
     """벡터스토어에서 관련 내용을 검색합니다."""
     global unified_vectorstore
+
+    # 벡터스토어가 초기화되지 않은 경우 에러 메시지 반환
     if unified_vectorstore is None:
         return "오류: 벡터스토어가 초기화되지 않았습니다."
 
-    print(f"INFO: RAG 검색 실행 -> 제안서: '{proposal_file}', 토픽: '{topic}'")
-    
-    # proposal_file 이름을 메타데이터 필터로 사용하여 검색
+    print(f"  🔍 RAG 검색 실행 -> 제안서: '{proposal_file}', 토픽: '{topic}'")
+
+    # 벡터스토어에서 유사도 검색 수행
+    # - query: 검색 쿼리 (토픽)
+    # - k: 반환할 결과 개수 (상위 2개)
+    # - filter: 메타데이터 필터링 (특정 제안서만 검색)
     results = unified_vectorstore.similarity_search(
         query=topic,
         k=2,  # 더 많은 컨텍스트를 위해 2개로 증가
         filter={"proposal_name": proposal_file}
     )
-    
+
+    # 검색 결과가 없는 경우
     if not results:
         return "관련 내용을 찾을 수 없습니다."
-        
-    # 검색된 결과들을 하나의 문자열로 합침
+
+    # 검색된 여러 청크를 하나의 문자열로 합침
     context = "\n\n---\n\n".join([doc.page_content for doc in results])
     
     # 컨텍스트 길이 제한
@@ -242,20 +484,52 @@ def get_llm_model():
 # =================================================================
 
 async def main():
-    print("## 동적 Agent 생성 및 평가 프로세스를 시작합니다.")
-    
+    """
+    메인 함수: 제안서 자동 평가 프로세스 실행
+
+    전체 흐름:
+    1. RAG 파이프라인 초기화 (임베딩 모델, 벡터스토어)
+    2. Phase 1: 심사 항목 자동 분류 (Dispatcher Agent)
+    3. Phase 2: 대분류별 전문가 Agent가 병렬 평가
+    4. Phase 3: 최종 보고서 작성 (Reporting Agent)
+    """
+    print("\n" + "="*70)
+    print("  동적 Agent 생성 및 평가 프로세스를 시작합니다.")
+    print("="*70)
+
     # --- [전제] RAG 파이프라인 초기화 ---
     # 메인 프로세스 시작 전, 벡터스토어를 먼저 준비합니다.
     global unified_vectorstore
-    proposal_files = glob.glob(os.path.join(PROPOSAL_DIR, "*.txt")) # .txt 제안서만 대상으로 함
-    
-    if not proposal_files or not os.path.exists(RFP_PATH):
-        print("오류: 제안서 또는 RFP 파일이 없습니다. 경로를 확인하세요.")
+
+    # 제안서 파일 검색 (.txt, .html 등)
+    proposal_files = glob.glob(os.path.join(PROPOSAL_DIR, "*.txt"))
+    proposal_files.extend(glob.glob(os.path.join(PROPOSAL_DIR, "*.html")))
+
+    # 파일 존재 여부 확인
+    if not proposal_files:
+        print("❌ 오류: 제안서 파일이 없습니다. 경로를 확인하세요.")
+        print(f"   - 제안서 디렉토리: {PROPOSAL_DIR}")
         return
-        
+
+    if not os.path.exists(RFP_PATH):
+        print("❌ 오류: RFP 파일이 없습니다. 경로를 확인하세요.")
+        print(f"   - RFP 경로: {RFP_PATH}")
+        return
+
+    print(f"\n✅ 제안서 파일 {len(proposal_files)}개 발견:")
+    for pf in proposal_files:
+        print(f"   - {os.path.basename(pf)}")
+
+    # RAG 컴포넌트 초기화 (임베딩 모델, ChromaDB)
     embedding_model, chroma_client = initialize_rag_components()
+
+    # 통합 벡터스토어 생성 (제안서 + RFP + 사내정보)
     unified_vectorstore = create_unified_vectorstore(
-        proposal_files, RFP_PATH, embedding_model, chroma_client
+        proposal_files=proposal_files,
+        rfp_path=RFP_PATH,
+        internal_data_dir=INTERNAL_DATA_DIR,  # 사내 정보 디렉토리 추가!
+        embedding_model=embedding_model,
+        chroma_client=chroma_client
     )
     # --- RAG 초기화 완료 ---
 
@@ -272,7 +546,11 @@ async def main():
     # =================================================================
     # Phase 1: Dispatcher가 대분류를 스스로 찾아내고 항목 분류
     # =================================================================
-    print("\n--- [Phase 1] Dispatcher Agent가 대분류를 식별하고 항목을 분류합니다 ---")
+    # 목적: 비정형 심사 항목 리스트를 '대분류' 기준으로 자동 그룹화
+    # 예: {"기술": [...], "관리": [...], "가격": [...]}
+    print("\n" + "="*70)
+    print("  [Phase 1] 심사 항목 자동 분류")
+    print("="*70)
     
     dispatcher_agent = Agent(
         role="평가 항목 자동 분류 및 그룹화 전문가",
@@ -326,17 +604,26 @@ async def main():
     # =================================================================
     # Phase 2: 대분류 개수만큼 동적으로 Agent를 생성하고 병렬 평가
     # =================================================================
-    print("\n--- [Phase 2] 발견된 대분류별로 전문가 Agent를 동적으로 생성하여 병렬 평가합니다 ---")
-    
+    # 목적:
+    # - 각 대분류(기술, 관리, 가격 등)별로 전문가 Agent를 동적 생성
+    # - 각 제안서를 순회하며 모든 심사 항목을 병렬 평가
+    # - RAG를 통해 제안서에서 관련 내용을 자동 추출하여 평가 근거로 활용
+    print("\n" + "="*70)
+    print("  [Phase 2] 발견된 대분류별로 전문가 Agent를 동적으로 생성하여 병렬 평가합니다")
+    print("="*70)
+
     # 모든 제안서 파일에 대해 평가를 반복합니다.
     for proposal_path in proposal_files:
         proposal_name = os.path.basename(proposal_path)
         print(f"\n\n{'='*20} [{proposal_name}] 평가 시작 {'='*20}")
 
-        specialist_agents = []
-        evaluation_tasks = []
+        # 제안서별로 Agent와 Task 리스트 초기화
+        specialist_agents = []  # 전문가 Agent 리스트
+        evaluation_tasks = []   # 평가 Task 리스트
 
+        # 대분류별로 전문가 Agent를 동적 생성
         for category, items in categorized_items.items():
+            # 대분류별 전문가 Agent 생성 (예: "기술 부문 전문 평가관")
             specialist_agent = Agent(
                 role=f"'{category}' 부문 전문 평가관",
                 goal=f"'{proposal_name}' 제안서의 '{category}' 부문을 전문적으로 평가",
@@ -346,37 +633,58 @@ async def main():
             )
             specialist_agents.append(specialist_agent)
 
+            # 해당 대분류의 모든 심사 항목에 대한 Task 생성
             for item in items:
-                # 수정된 RAG 함수 호출
+                # RAG를 통해 제안서에서 관련 내용 검색
+                # - 벡터스토어에서 토픽과 유사한 내용을 자동으로 찾아옴
                 context = get_context_for_topic(proposal_name, item['topic'])
-                
+
+                # 평가 Task 생성
                 task = Task(
                     description=f"제안서 '{proposal_name}'의 '{item.get('topic', 'N/A')}' 항목을 평가하시오.\n\n심사기준: {item.get('criteria', 'N/A')}\n\n관련내용:\n{context}\n\n평가점수(1-100), 요약, 근거를 포함한 보고서를 작성하시오.",
                     expected_output=f"평가점수(1-100), 요약, 근거를 포함한 '{item.get('topic', 'N/A')}' 평가보고서",
                     agent=specialist_agent
                 )
                 evaluation_tasks.append(task)
-        
+
+        # Task가 없으면 다음 제안서로
         if not evaluation_tasks:
-            print("평가할 작업이 없습니다.")
+            print("⚠ 평가할 작업이 없습니다.")
             continue
 
+        # Crew 구성 및 병렬 평가 실행
+        # - 여러 전문가 Agent가 각자의 Task를 동시에 수행
+        print(f"\n⏳ {len(evaluation_tasks)}개 평가 항목을 처리 중...")
         evaluation_crew = Crew(
             agents=specialist_agents,
             tasks=evaluation_tasks,
             verbose=False  # 출력 간소화
         )
-        final_results = await evaluation_crew.kickoff_async()
+        final_results = await evaluation_crew.kickoff_async()  # 비동기 병렬 실행
 
-        print(f"\n--- [Phase 3] [{proposal_name}] 최종 보고서를 작성합니다 ---")
+        # =================================================================
+        # Phase 3: 최종 보고서 작성 (Reporting Agent)
+        # =================================================================
+        # 목적:
+        # - 모든 개별 평가 보고서를 종합하여 하나의 최종 보고서 작성
+        # - 제안서 전체에 대한 종합 평가, 강점/약점 분석, 최종 점수 제시
+        print(f"\n{'='*70}")
+        print(f"  [Phase 3] [{proposal_name}] 최종 보고서 작성")
+        print(f"{'='*70}")
+
+        # 개별 평가 보고서들을 하나의 문자열로 합침
         individual_reports = "\n\n".join([str(result) for result in final_results])
 
+        # 최종 보고서 작성 Agent 생성
         reporting_agent = Agent(
             role="수석 평가 분석가",
             goal="여러 개의 개별 평가 보고서를 종합하여, 경영진이 의사결정을 내릴 수 있도록 하나의 완성된 최종 보고서를 작성",
             backstory="당신은 여러 부서의 보고를 취합하여 핵심만 요약하고, 전체적인 관점에서 강점과 약점을 분석하여 최종 보고서를 작성하는 데 매우 능숙합니다.",
-            llm=llm, verbose=True
+            llm=llm,
+            verbose=True
         )
+
+        # 최종 보고서 작성 Task 생성
         reporting_task = Task(
             description=f"""'{proposal_name}' 제안서의 개별 평가보고서를 종합하여 최종보고서를 작성하시오.
 
@@ -402,6 +710,8 @@ async def main():
             expected_output="서론, 종합 의견, 항목별 상세 분석, 세부 평가 내용, 최종 점수, 추천 사항, 결론이 포함된 완성된 형태의 최종 평가 보고서",
             agent=reporting_agent
         )
+
+        # 최종 보고서 생성 Crew 실행
         reporting_crew = Crew(agents=[reporting_agent], tasks=[reporting_task], verbose=False)
         final_comprehensive_report = reporting_crew.kickoff()
 
